@@ -70,6 +70,54 @@ async def check_openai_connection():
         logger.error(f"Erro ao conectar com OpenAI: {e}")
         return False, f"Erro ao conectar com a API da OpenAI: {e}"
 
+async def get_openai_usage():
+    """Obtém informações de uso da OpenAI"""
+    try:
+        # Tentar obter informações de uso da API usando a nova API de billing
+        try:
+            # Usar a API de billing para obter informações de uso
+            billing_response = openai_client.billing.usage.list()
+            
+            if billing_response and hasattr(billing_response, 'data'):
+                usage_data = billing_response.data[0] if billing_response.data else None
+                if usage_data:
+                    # Calcular uso em dólares
+                    total_usage = usage_data.total_usage / 100  # Convert from cents to dollars
+                    
+                    # Obter informações do período
+                    start_date = usage_data.start_date
+                    end_date = usage_data.end_date
+                    
+                    usage_info = f"**Período:** {start_date} a {end_date}\n"
+                    usage_info += f"**Uso Total:** ${total_usage:.2f}\n"
+                    
+                    # Se houver limite de crédito
+                    if hasattr(usage_data, 'granted') and usage_data.granted:
+                        granted = usage_data.granted / 100
+                        usage_info += f"**Crédito Disponível:** ${granted:.2f}\n"
+                        usage_info += f"**Restante:** ${(granted - total_usage):.2f}"
+                    
+                    return True, usage_info
+        except Exception as api_error:
+            logger.warning(f"API de billing não disponível: {api_error}")
+        
+        # Fallback: tentar obter informações básicas de uso
+        try:
+            # Tentar usar a API de usage (método alternativo)
+            usage_response = openai_client.usage.list()
+            if usage_response and hasattr(usage_response, 'data'):
+                usage_data = usage_response.data[0] if usage_response.data else None
+                if usage_data:
+                    return True, f"**Uso de Tokens:** {usage_data.usage.total_tokens:,} tokens\n**Limite:** {usage_data.usage.granted:,} tokens"
+        except Exception as usage_error:
+            logger.warning(f"API de usage não disponível: {usage_error}")
+        
+        # Fallback final: informações básicas
+        return True, "**Informações de uso não estão disponíveis via API.**\n\nPara verificar seu uso detalhado, acesse:\n🔗 https://platform.openai.com/usage\n🔗 https://platform.openai.com/account/billing/usage"
+    except Exception as e:
+        logger.error(f"Erro ao obter uso da OpenAI: {e}")
+        return False, f"Erro ao obter informações de uso: {e}"
+
 def validate_image_extension(filename: str) -> bool:
     """Valida extensão de imagem"""
     if not filename:
@@ -283,37 +331,23 @@ async def on_ready():
         await db_manager.initialize()
         load_state()
         
-        channel = client.get_channel(Config.TARGET_CHANNEL_ID)
-        if not channel:
-            logger.error('Canal não encontrado. Verifique o TARGET_CHANNEL_ID.')
-            return
-        
-        # Verificar conexões
+        # Verificar conexões silenciosamente
         db_ok, db_msg = await check_database_connection()
         openai_ok, openai_msg = await check_openai_connection()
         
-        # Construir mensagem de status
-        status_message = "**Status do Bot:**\n"
-        status_message += f"- Banco de Dados: {'✅' if db_ok else '❌'} {db_msg}\n"
-        status_message += f"- OpenAI: {'✅' if openai_ok else '❌'} {openai_msg}\n"
+        if not db_ok:
+            logger.error(f'Erro no banco de dados: {db_msg}')
+        if not openai_ok:
+            logger.error(f'Erro na OpenAI: {openai_msg}')
         
-        cat_msg = None
         if db_ok:
             categories, cat_msg = await get_categories()
             if cat_msg:
                 logger.error(f'Erro ao buscar categorias: {cat_msg}')
-                status_message += f"- Categorias: ❌ {cat_msg}\n"
             else:
                 logger.info(f'{len(categories)} categorias carregadas.')
-                status_message += f"- Categorias: ✅ {len(categories)} categorias carregadas.\n"
         
-        if db_ok and openai_ok and not cat_msg:
-            status_message += "\nEstou online e pronto para receber imagens! 🤖"
-        else:
-            status_message += "\nO bot encontrou problemas na inicialização. Por favor, verifique os logs."
-        
-        await channel.send(status_message)
-        logger.info('Mensagem de status enviada com sucesso.')
+        logger.info('Bot inicializado com sucesso.')
         
     except Exception as e:
         logger.error(f'Erro na inicialização: {e}')
@@ -325,6 +359,12 @@ async def on_message(message):
         return
 
     try:
+        # Processar comandos especiais no canal principal
+        if message.channel.id == Config.TARGET_CHANNEL_ID and message.content.startswith('/'):
+            command = message.content[1:].lower().strip()
+            await handle_command(message, command)
+            return
+
         # Processar imagens no canal principal
         if message.channel.id == Config.TARGET_CHANNEL_ID and message.attachments:
             for attachment in message.attachments:
@@ -845,6 +885,236 @@ Classifique este gasto de R$ {expense_info['value']:.2f} nas categorias disponí
     except Exception as e:
         logger.error(f"Erro ao processar gasto em texto: {e}")
         await thread.send(f"Ocorreu um erro ao processar o gasto: {e}")
+
+async def handle_command(message, command):
+    """Processa comandos especiais"""
+    try:
+        if command == "status":
+            await handle_status_command(message)
+        elif command == "usage":
+            await handle_usage_command(message)
+        elif command == "contas":
+            await handle_contas_command(message)
+        elif command == "categorias":
+            await handle_categorias_command(message)
+        elif command == "help":
+            await handle_help_command(message)
+        elif command == "ping":
+            await handle_ping_command(message)
+        else:
+            await message.channel.send("❌ Comando não reconhecido. Digite `/help` para ver os comandos disponíveis.")
+    except Exception as e:
+        logger.error(f"Erro ao processar comando {command}: {e}")
+        await message.channel.send("❌ Erro ao processar comando. Tente novamente.")
+
+async def handle_status_command(message):
+    """Comando status - verifica se o bot está online"""
+    try:
+        db_ok, db_msg = await check_database_connection()
+        openai_ok, openai_msg = await check_openai_connection()
+        
+        status_embed = discord.Embed(
+            title="🤖 Status do Bot",
+            color=discord.Color.green() if (db_ok and openai_ok) else discord.Color.red(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        status_embed.add_field(
+            name="📊 Banco de Dados",
+            value=f"{'✅ Online' if db_ok else '❌ Offline'}\n{db_msg}",
+            inline=True
+        )
+        
+        status_embed.add_field(
+            name="🧠 OpenAI",
+            value=f"{'✅ Online' if openai_ok else '❌ Offline'}\n{openai_msg}",
+            inline=True
+        )
+        
+        if db_ok and openai_ok:
+            status_embed.add_field(
+                name="🎯 Status Geral",
+                value="✅ Bot online e funcionando!",
+                inline=False
+            )
+        else:
+            status_embed.add_field(
+                name="🎯 Status Geral",
+                value="❌ Bot com problemas. Verifique os logs.",
+                inline=False
+            )
+        
+        await message.channel.send(embed=status_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando status: {e}")
+        await message.channel.send("❌ Erro ao verificar status.")
+
+async def handle_usage_command(message):
+    """Comando usage - mostra uso de tokens da OpenAI"""
+    try:
+        usage_ok, usage_msg = await get_openai_usage()
+        
+        usage_embed = discord.Embed(
+            title="💰 Uso da OpenAI",
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        if usage_ok:
+            usage_embed.add_field(
+                name="📈 Informações de Uso",
+                value=usage_msg,
+                inline=False
+            )
+            
+            # Adicionar informações adicionais
+            usage_embed.add_field(
+                name="💡 Dicas",
+                value="• Monitore seu uso regularmente\n• Configure alertas de gastos\n• Use modelos mais eficientes quando possível",
+                inline=False
+            )
+        else:
+            usage_embed.add_field(
+                name="❌ Erro",
+                value=usage_msg,
+                inline=False
+            )
+        
+        usage_embed.set_footer(text="💳 Para configurações de billing, acesse: https://platform.openai.com/account/billing")
+        
+        await message.channel.send(embed=usage_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando usage: {e}")
+        await message.channel.send("❌ Erro ao obter informações de uso.")
+
+async def handle_contas_command(message):
+    """Comando contas - lista todas as contas disponíveis"""
+    try:
+        accounts = await db_manager.get_available_accounts()
+        
+        if not accounts:
+            await message.channel.send("📋 **Contas disponíveis:**\nNenhuma conta encontrada no banco de dados.")
+            return
+        
+        contas_embed = discord.Embed(
+            title="🏦 Contas Disponíveis",
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        accounts_text = "\n".join([f"• {account}" for account in accounts])
+        contas_embed.add_field(
+            name=f"📋 Total: {len(accounts)} conta(s)",
+            value=accounts_text,
+            inline=False
+        )
+        
+        await message.channel.send(embed=contas_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando contas: {e}")
+        await message.channel.send("❌ Erro ao listar contas.")
+
+async def handle_categorias_command(message):
+    """Comando categorias - lista todas as categorias disponíveis"""
+    try:
+        categories, error_msg = await get_categories()
+        
+        if error_msg:
+            await message.channel.send(f"❌ Erro ao buscar categorias: {error_msg}")
+            return
+        
+        categorias_embed = discord.Embed(
+            title="📂 Categorias Disponíveis",
+            color=discord.Color.purple(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        categories_text = "\n".join([f"• {category}" for category in categories])
+        categorias_embed.add_field(
+            name=f"📋 Total: {len(categories)} categoria(s)",
+            value=categories_text,
+            inline=False
+        )
+        
+        await message.channel.send(embed=categorias_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando categorias: {e}")
+        await message.channel.send("❌ Erro ao listar categorias.")
+
+async def handle_help_command(message):
+    """Comando help - mostra todos os comandos disponíveis"""
+    try:
+        help_embed = discord.Embed(
+            title="❓ Comandos Disponíveis",
+            description="Lista de todos os comandos que você pode usar:",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        commands = [
+            ("/status", "Verifica se o bot está online e funcionando"),
+            ("/usage", "Mostra informações de uso da OpenAI"),
+            ("/contas", "Lista todas as contas disponíveis no banco"),
+            ("/categorias", "Lista todas as categorias disponíveis"),
+            ("/ping", "Testa a latência/resposta do bot"),
+            ("/help", "Mostra esta mensagem de ajuda")
+        ]
+        
+        for cmd, desc in commands:
+            help_embed.add_field(
+                name=cmd,
+                value=desc,
+                inline=False
+            )
+        
+        help_embed.add_field(
+            name="📸 Como usar",
+            value="• Envie uma imagem de cupom fiscal para classificação automática\n• Digite gastos em texto (ex: 'gastei R$ 50 no mercado')\n• Use os comandos acima para informações do sistema",
+            inline=False
+        )
+        
+        await message.channel.send(embed=help_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando help: {e}")
+        await message.channel.send("❌ Erro ao mostrar ajuda.")
+
+async def handle_ping_command(message):
+    """Comando ping - testa latência/resposta do bot"""
+    try:
+        start_time = datetime.datetime.now()
+        
+        # Calcular latência
+        end_time = datetime.datetime.now()
+        latency = (end_time - start_time).total_seconds() * 1000
+        
+        ping_embed = discord.Embed(
+            title="🏓 Pong!",
+            color=discord.Color.green(),
+            timestamp=end_time
+        )
+        
+        ping_embed.add_field(
+            name="⏱️ Latência",
+            value=f"{latency:.1f}ms",
+            inline=True
+        )
+        
+        ping_embed.add_field(
+            name="🤖 Status",
+            value="✅ Bot respondendo!",
+            inline=True
+        )
+        
+        await message.channel.send(embed=ping_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando ping: {e}")
+        await message.channel.send("❌ Erro no comando ping.")
 
 # Inicializar bot
 try:
