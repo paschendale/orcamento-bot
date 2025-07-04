@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  orcamento-bot:
+    image: paschendale/orcamento-bot:latest
+    container_name: orcamento-bot
+    restart: always
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - TARGET_CHANNEL_ID=${TARGET_CHANNEL_ID}
+      - DATABASE_URL=${DATABASE_URL}
+    volumes:
+      - ./state.json:/app/state.json
