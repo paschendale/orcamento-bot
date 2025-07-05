@@ -195,6 +195,97 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Erro ao inserir transações agrupadas: {e}")
             return 0, 0
+    
+    async def insert_transfer(self, data, valor: float, conta_origem: str, conta_destino: str, descricao: str = None) -> Tuple[bool, str]:
+        """Insere uma transferência entre contas"""
+        try:
+            if not self.pool:
+                return False, "Pool de conexões não inicializado"
+            
+            # Validações
+            if not conta_origem or not conta_destino:
+                return False, "Conta de origem e destino são obrigatórias"
+            
+            if conta_origem == conta_destino:
+                return False, "Conta de origem e destino não podem ser iguais"
+            
+            if valor <= 0:
+                return False, "Valor da transferência deve ser maior que zero"
+            
+            # Validar se as contas existem
+            if not await self.validate_account(conta_origem):
+                return False, f"Conta de origem '{conta_origem}' não encontrada"
+            
+            if not await self.validate_account(conta_destino):
+                return False, f"Conta de destino '{conta_destino}' não encontrada"
+            
+            # Criar descrição padrão se não fornecida
+            if not descricao:
+                descricao = f"[BOT] Transferência de {conta_origem} para {conta_destino}"
+            else:
+                # Se descrição foi fornecida, adicionar prefixo [BOT]
+                if not descricao.startswith("[BOT]"):
+                    descricao = f"[BOT] {descricao}"
+            
+            async with self.pool.acquire() as conn:
+                # Inserir saída da conta de origem (valor negativo)
+                await conn.execute("""
+                    INSERT INTO public.transacoes (data, descricao, conta, categoria, centro_custo, valor)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, data, descricao, conta_origem, "Transferência", "Nenhum", -valor)
+                
+                # Inserir entrada na conta de destino (valor positivo)
+                await conn.execute("""
+                    INSERT INTO public.transacoes (data, descricao, conta, categoria, centro_custo, valor)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, data, descricao, conta_destino, "Transferência", "Nenhum", valor)
+                
+            logger.info(f"Transferência inserida: R$ {valor:.2f} de '{conta_origem}' para '{conta_destino}'")
+            return True, "Transferência realizada com sucesso"
+            
+        except Exception as e:
+            logger.error(f"Erro ao inserir transferência: {e}")
+            return False, f"Erro ao inserir transferência: {e}"
+    
+    async def get_transfer_history(self, conta: str = None, limit: int = 10) -> List[dict]:
+        """Busca histórico de transferências"""
+        try:
+            if not self.pool:
+                return []
+            
+            async with self.pool.acquire() as conn:
+                if conta:
+                    rows = await conn.fetch("""
+                        SELECT id, data, descricao, conta, valor
+                        FROM public.transacoes 
+                        WHERE categoria = 'Transferência' AND conta = $1
+                        ORDER BY data DESC, id DESC
+                        LIMIT $2
+                    """, conta, limit)
+                else:
+                    rows = await conn.fetch("""
+                        SELECT id, data, descricao, conta, valor
+                        FROM public.transacoes 
+                        WHERE categoria = 'Transferência'
+                        ORDER BY data DESC, id DESC
+                        LIMIT $1
+                    """, limit)
+                
+                transfers = []
+                for row in rows:
+                    transfers.append({
+                        'id': row['id'],
+                        'data': row['data'],
+                        'descricao': row['descricao'],
+                        'conta': row['conta'],
+                        'valor': float(row['valor'])
+                    })
+                
+                return transfers
+                
+        except Exception as e:
+            logger.error(f"Erro ao buscar histórico de transferências: {e}")
+            return []
 
 # Instância global do gerenciador de banco
 db_manager = DatabaseManager()
@@ -210,3 +301,11 @@ async def insert_transaction(data, descricao, conta, categoria, centro_custo, va
     success = await db_manager.insert_transaction(data, descricao, conta, categoria, centro_custo, valor)
     if not success:
         raise Exception("Falha ao inserir transação")
+
+async def insert_transfer(data, valor: float, conta_origem: str, conta_destino: str, descricao: str = None):
+    """Função auxiliar para inserir transferência"""
+    return await db_manager.insert_transfer(data, valor, conta_origem, conta_destino, descricao)
+
+async def get_transfer_history(conta: str = None, limit: int = 10):
+    """Função auxiliar para buscar histórico de transferências"""
+    return await db_manager.get_transfer_history(conta, limit)

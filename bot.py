@@ -6,7 +6,7 @@ import datetime
 import re
 from typing import Dict, Any, Optional, List
 from config import Config
-from database import db_manager, get_categories, insert_transaction, check_database_connection, db_manager
+from database import db_manager, get_categories, insert_transaction, check_database_connection, db_manager, insert_transfer, get_transfer_history
 
 # Configurar logging estruturado
 logging.basicConfig(
@@ -258,8 +258,19 @@ Responda APENAS com o JSON, sem texto adicional."""
 
         # Preparar contexto para serialização JSON (converter date para string)
         context_for_json = context.copy()
-        if 'data_compra' in context_for_json and isinstance(context_for_json['data_compra'], datetime.date):
-            context_for_json['data_compra'] = context_for_json['data_compra'].isoformat()
+        
+        # Função para converter objetos date para string
+        def convert_dates_to_strings(obj):
+            if isinstance(obj, datetime.date):
+                return obj.isoformat()
+            elif isinstance(obj, dict):
+                return {k: convert_dates_to_strings(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_dates_to_strings(item) for item in obj]
+            else:
+                return obj
+        
+        context_for_json = convert_dates_to_strings(context_for_json)
 
         user_prompt = f"""
 Comando do usuário: "{user_input}"
@@ -304,7 +315,7 @@ Responda APENAS com o JSON da ação."""
         logger.error(f"Erro JSON ao processar comando: {e}")
         # Fallback para comandos simples
         user_input_lower = user_input.lower()
-        if any(keyword in user_input_lower for keyword in ["sim", "ok", "pode seguir", "confirmo", "correto"]):
+        if any(keyword in user_input_lower for keyword in ["sim", "ok", "pode seguir", "confirmo", "correto", "manda bala", "confirma"]):
             return {"action": "confirm", "message": "Confirmação recebida"}
         elif any(keyword in user_input_lower for keyword in ["troque", "mude", "altere", "corrija"]):
             return {"action": "edit", "message": "Editando classificação"}
@@ -378,17 +389,39 @@ async def on_message(message):
                     await thread.send("Olá! Recebi a sua imagem e vou analisá-la. Em breve, enviarei a classificação dos produtos.")
                     await process_image(thread, attachment.url)
 
-        # Processar mensagens de texto com gastos no canal principal
+        # Processar mensagens de texto no canal principal
         elif message.channel.id == Config.TARGET_CHANNEL_ID and not message.attachments:
-            expense_info = detect_expense_in_message(message.content)
-            if expense_info:
-                thread = await message.create_thread(name=f"Gasto de R$ {expense_info['value']:.2f}")
+            # Detectar intenção da mensagem com OpenAI
+            intent_result = await detect_message_intent_with_ai(message.content)
+            
+            if intent_result["intent"] == "transfer":
+                # Processar transferência
+                extracted_data = intent_result.get("extracted_data", {})
+                valor = extracted_data.get("valor", 0)
+                thread_name = f"Transferência de R$ {valor:.2f}" if valor > 0 else "Transferência"
+                
+                thread = await message.create_thread(name=thread_name)
                 user_classifications[str(thread.id)] = {
                     "message_content": message.content,
                     "user_id": str(message.author.id)
                 }
                 save_state()
-                await thread.send(f"Olá! Identifiquei um gasto de R$ {expense_info['value']:.2f} na sua mensagem. Vou analisá-lo e gerar uma classificação.")
+                await thread.send("Olá! Identifiquei uma transferência na sua mensagem. Vou analisá-la e processar.")
+                await process_transfer_with_ai(thread, message.content)
+                
+            elif intent_result["intent"] == "expense":
+                # Processar gasto
+                extracted_data = intent_result.get("extracted_data", {})
+                valor = extracted_data.get("valor", 0)
+                thread_name = f"Gasto de R$ {valor:.2f}" if valor > 0 else "Gasto"
+                
+                thread = await message.create_thread(name=thread_name)
+                user_classifications[str(thread.id)] = {
+                    "message_content": message.content,
+                    "user_id": str(message.author.id)
+                }
+                save_state()
+                await thread.send(f"Olá! Identifiquei um gasto na sua mensagem. Vou analisá-lo e gerar uma classificação.")
                 await process_text_expense(thread, message.content)
 
         # Processar respostas em threads
@@ -396,6 +429,8 @@ async def on_message(message):
             thread_id = str(message.channel.id)
             if "classification_data" in user_classifications[thread_id]:
                 await handle_user_response(message)
+            elif "transfer_data" in user_classifications[thread_id]:
+                await handle_transfer_response(message)
 
     except Exception as e:
         logger.error(f"Erro ao processar mensagem: {e}")
@@ -725,52 +760,43 @@ async def save_transactions(message, context):
         logger.error(f"Erro ao salvar transações: {e}")
         await message.channel.send("Erro ao salvar transações. Tente novamente.")
 
-def detect_expense_in_message(message_content: str) -> Optional[Dict[str, Any]]:
-    """Detecta se uma mensagem contém informações de gasto"""
-    # Padrões para detectar gastos
-    patterns = [
-        # Padrão: "gastei R$ 50 no mercado" ou "comprei R$ 30 de comida"
-        r'(?:gastei|comprei|paguei|gastei|compras?|mercado|farmácia|farmacia|restaurante|lanche|uber|99|ifood|rappi|delivery|alimentação|alimentacao)\s+(?:de\s+)?(?:r?\$?\s*)?([\d,]+\.?\d*)',
-        # Padrão: "R$ 25,50 no supermercado" ou "$ 15.30 na farmácia"
-        r'(?:r?\$?\s*)([\d,]+\.?\d*)\s+(?:no|na|em|para|com|de)\s+(?:mercado|supermercado|farmácia|farmacia|restaurante|lanche|uber|99|ifood|rappi|delivery|alimentação|alimentacao|compras?)',
-        # Padrão: "compras: R$ 45,60" ou "gastos: $ 30"
-        r'(?:compras?|gastos?|total|valor):\s*(?:r?\$?\s*)?([\d,]+\.?\d*)',
-        # Padrão: "R$ 50" seguido de contexto de compra
-        r'(?:r?\$?\s*)([\d,]+\.?\d*)(?:\s+(?:no|na|em|para|com|de|em|mercado|supermercado|farmácia|farmacia|restaurante|lanche|uber|99|ifood|rappi|delivery|alimentação|alimentacao|compras?))?'
-    ]
-    
-    message_lower = message_content.lower()
-    
-    # Verificar se a mensagem contém palavras-chave de gasto
-    expense_keywords = [
-        'gastei', 'comprei', 'paguei', 'compras', 'mercado', 'farmácia', 'farmacia', 
-        'restaurante', 'lanche', 'uber', '99', 'ifood', 'rappi', 'delivery', 
-        'alimentação', 'alimentacao', 'gastos', 'total', 'valor'
-    ]
-    
-    has_expense_keyword = any(keyword in message_lower for keyword in expense_keywords)
-    
-    if not has_expense_keyword:
-        return None
-    
-    # Procurar por valores monetários
-    for pattern in patterns:
-        matches = re.findall(pattern, message_lower)
-        if matches:
-            # Pegar o primeiro valor encontrado
-            value_str = matches[0].replace(',', '.')
+async def save_transfer(message, context):
+    """Salva transferência no banco de dados"""
+    try:
+        transfer_data = context["transfer_data"]
+        
+        # Extrair dados da transferência
+        valor = transfer_data["valor"]
+        conta_origem = transfer_data["conta_origem"]
+        conta_destino = transfer_data["conta_destino"]
+        data_transferencia = transfer_data["data_transferencia"]
+        descricao = transfer_data["descricao"]
+        
+        # Garantir que data_transferencia seja um objeto date
+        if isinstance(data_transferencia, str):
             try:
-                value = float(value_str)
-                if value > 0:
-                    return {
-                        'value': value,
-                        'message': message_content,
-                        'detected_pattern': pattern
-                    }
-            except ValueError:
-                continue
-    
-    return None
+                data_transferencia = datetime.datetime.fromisoformat(data_transferencia).date()
+            except:
+                data_transferencia = datetime.date.today()
+        
+        # Salvar transferência no banco
+        success, message_result = await insert_transfer(
+            data_transferencia, valor, conta_origem, conta_destino, descricao
+        )
+        
+        if success:
+            await message.channel.send(f"✅ Transferência de R$ {valor:.2f} de '{conta_origem}' para '{conta_destino}' realizada com sucesso!")
+        else:
+            await message.channel.send(f"❌ Erro ao salvar transferência: {message_result}")
+            return
+        
+        await message.channel.send("Este tópico será arquivado. Obrigado!")
+        del user_classifications[str(message.channel.id)]
+        save_state()
+        
+    except Exception as e:
+        logger.error(f"Erro ao salvar transferência: {e}")
+        await message.channel.send("Erro ao salvar transferência. Tente novamente.")
 
 async def process_text_expense(thread, message_content: str):
     """Processa gasto informado em texto com OpenAI"""
@@ -780,20 +806,17 @@ async def process_text_expense(thread, message_content: str):
             await thread.send(f"Ocorreu um erro ao buscar as categorias: {error_msg}")
             return
 
-        # Detectar informações do gasto
-        expense_info = detect_expense_in_message(message_content)
-        if not expense_info:
-            await thread.send("Não consegui identificar informações de gasto na sua mensagem. Por favor, seja mais específico (ex: 'gastei R$ 50 no mercado' ou 'comprei R$ 30 de comida').")
-            return
-
         # Obter data atual
         data_atual = datetime.date.today()
         
         system_prompt = f"""Você é um assistente que ajuda a classificar gastos em categorias.
 
-Analise a mensagem do usuário e classifique o gasto em uma das seguintes categorias: {categories}
+Analise a mensagem do usuário e extraia:
+1. O valor do gasto
+2. O estabelecimento ou tipo de local
+3. A categoria mais apropriada
 
-A mensagem do usuário contém informações sobre um gasto de R$ {expense_info['value']:.2f}.
+Categorias disponíveis: {categories}
 
 IMPORTANTE: Use SEMPRE a data atual ({data_atual.strftime('%Y-%m-%d')}) para a data da compra, a menos que a mensagem especifique claramente uma data diferente.
 
@@ -804,7 +827,7 @@ Retorne um JSON com a seguinte estrutura:
     "itens": [
         {{
             "descricao": "descrição do item ou tipo de gasto",
-            "valor": {expense_info['value']:.2f},
+            "valor": valor_extraído_da_mensagem,
             "categoria": "categoria mais apropriada"
         }}
     ]
@@ -818,7 +841,7 @@ Se a mensagem mencionar múltiplos itens, crie um item para cada um."""
         user_prompt = f"""
 Mensagem do usuário: "{message_content}"
 
-Classifique este gasto de R$ {expense_info['value']:.2f} nas categorias disponíveis."""
+Extraia o valor do gasto e classifique nas categorias disponíveis."""
 
         response = openai_client.chat.completions.create(
             model=Config.OPENAI_MODEL,
@@ -886,6 +909,165 @@ Classifique este gasto de R$ {expense_info['value']:.2f} nas categorias disponí
         logger.error(f"Erro ao processar gasto em texto: {e}")
         await thread.send(f"Ocorreu um erro ao processar o gasto: {e}")
 
+async def process_transfer_with_ai(thread, message_content: str):
+    """Processa transferência informada em texto com OpenAI"""
+    try:
+        # Obter contas disponíveis
+        available_accounts = await db_manager.get_available_accounts()
+        if not available_accounts:
+            await thread.send("Erro: Não foi possível obter a lista de contas disponíveis.")
+            return
+
+        # Obter data atual
+        data_atual = datetime.date.today()
+        
+        system_prompt = f"""Você é um assistente que ajuda a processar transferências entre contas bancárias.
+
+Analise a mensagem do usuário e identifique:
+1. O valor da transferência
+2. A conta de origem (de onde o dinheiro sai)
+3. A conta de destino (para onde o dinheiro vai)
+4. A data da transferência (use a data atual se não especificada)
+5. Uma descrição personalizada (se o usuário forneceu uma)
+
+Contas disponíveis: {available_accounts}
+
+IMPORTANTE: 
+- Use SEMPRE a data atual ({data_atual.strftime('%Y-%m-%d')}) para a data da transferência, a menos que a mensagem especifique claramente uma data diferente
+- Identifique a conta mais próxima do nome mencionado pelo usuário
+- Se não conseguir identificar uma conta específica, use o nome exato mencionado pelo usuário
+- Se o usuário forneceu uma descrição ou motivo para a transferência, inclua na descrição
+- Se não houver descrição específica, deixe o campo "descricao" vazio ou null
+
+Retorne um JSON com a seguinte estrutura:
+{{
+    "valor": valor_extraído_da_mensagem,
+    "conta_origem": "nome da conta de origem",
+    "conta_destino": "nome da conta de destino", 
+    "data": "{data_atual.strftime('%Y-%m-%d')}",
+    "descricao": "descrição personalizada ou null"
+}}
+
+Se não conseguir identificar uma das contas, use o nome exato mencionado pelo usuário."""
+
+        user_prompt = f"""
+Mensagem do usuário: "{message_content}"
+
+Contas disponíveis: {available_accounts}
+
+Processe esta transferência e retorne o JSON."""
+
+        response = openai_client.chat.completions.create(
+            model=Config.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=Config.OPENAI_MAX_TOKENS,
+        )
+        
+        response_json = response.choices[0].message.content
+        clean_response_json = response_json.strip().replace("```json", "").replace("```", "")
+        parsed_data = json.loads(clean_response_json)
+        
+        # Extrair dados da resposta
+        valor = float(parsed_data.get('valor', 0))
+        conta_origem = parsed_data.get('conta_origem', '')
+        conta_destino = parsed_data.get('conta_destino', '')
+        descricao = parsed_data.get('descricao', None)
+        
+        # Se não há descrição personalizada, usar None para que o banco crie a descrição padrão
+        if descricao is None or descricao == "" or descricao == "null":
+            descricao = None
+        
+        # Extrair e validar data
+        data_str = parsed_data.get('data', None)
+        if data_str:
+            try:
+                data_transferencia = datetime.datetime.strptime(data_str, '%Y-%m-%d').date()
+                # Verificar se a data não é muito antiga (mais de 30 dias)
+                data_limite = data_atual - datetime.timedelta(days=30)
+                if data_transferencia < data_limite:
+                    logger.warning(f"Data muito antiga retornada pela OpenAI: {data_transferencia}, usando data atual: {data_atual}")
+                    data_transferencia = data_atual
+            except (ValueError, TypeError):
+                data_transferencia = data_atual
+        else:
+            data_transferencia = data_atual
+        
+        # Validar dados
+        if valor <= 0:
+            raise ValueError("Valor da transferência deve ser maior que zero")
+        
+        if not conta_origem or not conta_destino:
+            raise ValueError("Conta de origem e destino são obrigatórias")
+        
+        if conta_origem == conta_destino:
+            raise ValueError("Conta de origem e destino não podem ser iguais")
+        
+        # Salvar dados da transferência no estado
+        user_classifications[str(thread.id)]["transfer_data"] = {
+            "valor": valor,
+            "conta_origem": conta_origem,
+            "conta_destino": conta_destino,
+            "data_transferencia": data_transferencia,
+            "descricao": descricao
+        }
+        save_state()
+        
+        # Mostrar resumo da transferência para confirmação
+        summary = f"""**💸 Transferência Detectada**
+
+💰 **Valor:** R$ {valor:.2f}
+📤 **De:** {conta_origem}
+📥 **Para:** {conta_destino}
+📅 **Data:** {data_transferencia.strftime('%d/%m/%Y')}
+📝 **Descrição:** {descricao}
+
+Por favor, confirme se está correto. Digite 'sim' ou 'ok' para confirmar, ou me diga o que deve ser alterado."""
+        
+        await thread.send(summary)
+        logger.info(f"Transferência processada com sucesso para thread {thread.id}")
+
+    except Exception as e:
+        logger.error(f"Erro ao processar transferência: {e}")
+        await thread.send(f"Ocorreu um erro ao processar a transferência: {e}")
+
+async def handle_transfer_response(message):
+    """Processa resposta do usuário para transferências"""
+    try:
+        thread_id = str(message.channel.id)
+        user_input = message.content
+        context = user_classifications[thread_id].copy()
+        
+        # Processar comando com OpenAI
+        ai_response = await process_user_input_with_ai(user_input, context)
+        
+        if ai_response["action"] == "confirm":
+            # Salvar transferência
+            await save_transfer(message, context)
+            
+        elif ai_response["action"] == "edit":
+            # Usar OpenAI para editar transferência
+            await edit_transfer_with_ai(message, context)
+            
+        elif ai_response["action"] == "help":
+            help_message = """**Comandos disponíveis para transferências:**
+- `sim`, `ok`, `pode seguir` - Confirma a transferência
+- `mude valor para [novo_valor]` - Altera o valor da transferência
+- `troque conta origem para [nova_conta]` - Altera a conta de origem
+- `troque conta destino para [nova_conta]` - Altera a conta de destino
+- `mude descrição para [nova_descricao]` - Altera a descrição da transferência
+- `ajuda` - Mostra esta mensagem"""
+            await message.channel.send(help_message)
+            
+        else:
+            await message.channel.send(ai_response["message"])
+            
+    except Exception as e:
+        logger.error(f"Erro ao processar resposta de transferência: {e}")
+        await message.channel.send("Desculpe, ocorreu um erro. Tente novamente.")
+
 async def handle_command(message, command):
     """Processa comandos especiais"""
     try:
@@ -901,6 +1083,8 @@ async def handle_command(message, command):
             await handle_help_command(message)
         elif command == "ping":
             await handle_ping_command(message)
+        elif command == "transferencias":
+            await handle_transferencias_command(message)
         else:
             await message.channel.send("❌ Comando não reconhecido. Digite `/help` para ver os comandos disponíveis.")
     except Exception as e:
@@ -1060,6 +1244,7 @@ async def handle_help_command(message):
             ("/usage", "Mostra informações de uso da OpenAI"),
             ("/contas", "Lista todas as contas disponíveis no banco"),
             ("/categorias", "Lista todas as categorias disponíveis"),
+            ("/transferencias", "Lista transferências recentes"),
             ("/ping", "Testa a latência/resposta do bot"),
             ("/help", "Mostra esta mensagem de ajuda")
         ]
@@ -1073,7 +1258,7 @@ async def handle_help_command(message):
         
         help_embed.add_field(
             name="📸 Como usar",
-            value="• Envie uma imagem de cupom fiscal para classificação automática\n• Digite gastos em texto (ex: 'gastei R$ 50 no mercado')\n• Use os comandos acima para informações do sistema",
+            value="• Envie uma imagem de cupom fiscal para classificação automática\n• Digite gastos em texto (ex: 'gastei R$ 50 no mercado')\n• Digite transferências (ex: 'transferi R$ 5000 da BB VI para Rico Ju' ou 'transf 3000 de nubank para itau para pagar conta')\n• Use os comandos acima para informações do sistema",
             inline=False
         )
         
@@ -1115,6 +1300,244 @@ async def handle_ping_command(message):
     except Exception as e:
         logger.error(f"Erro no comando ping: {e}")
         await message.channel.send("❌ Erro no comando ping.")
+
+async def handle_transferencias_command(message):
+    """Comando transferencias - lista transferências recentes"""
+    try:
+        # Buscar histórico de transferências
+        transfers = await get_transfer_history(limit=10)
+        
+        if not transfers:
+            await message.channel.send("📋 **Transferências recentes:**\nNenhuma transferência encontrada.")
+            return
+        
+        transferencias_embed = discord.Embed(
+            title="💸 Transferências Recentes",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now()
+        )
+        
+        # Agrupar transferências por data
+        transfers_by_date = {}
+        for transfer in transfers:
+            data_str = transfer['data'].strftime('%d/%m/%Y')
+            if data_str not in transfers_by_date:
+                transfers_by_date[data_str] = []
+            transfers_by_date[data_str].append(transfer)
+        
+        # Mostrar transferências agrupadas por data
+        for data_str, day_transfers in transfers_by_date.items():
+            transfers_text = ""
+            for transfer in day_transfers:
+                valor = transfer['valor']
+                if valor > 0:
+                    # Entrada na conta
+                    transfers_text += f"📥 **+R$ {valor:.2f}** em {transfer['conta']}\n"
+                else:
+                    # Saída da conta
+                    transfers_text += f"📤 **R$ {abs(valor):.2f}** de {transfer['conta']}\n"
+                transfers_text += f"   └ {transfer['descricao']}\n\n"
+            
+            transferencias_embed.add_field(
+                name=f"📅 {data_str}",
+                value=transfers_text.strip(),
+                inline=False
+            )
+        
+        transferencias_embed.set_footer(text=f"📊 Mostrando as {len(transfers)} transferências mais recentes")
+        
+        await message.channel.send(embed=transferencias_embed)
+        
+    except Exception as e:
+        logger.error(f"Erro no comando transferencias: {e}")
+        await message.channel.send("❌ Erro ao listar transferências.")
+
+async def detect_message_intent_with_ai(message_content: str) -> Dict[str, Any]:
+    """Detecta a intenção da mensagem usando OpenAI"""
+    try:
+        system_prompt = """Você é um assistente que analisa mensagens para identificar a intenção do usuário.
+
+Analise a mensagem e retorne APENAS um JSON válido com:
+{
+    "intent": "transfer|expense|command|other",
+    "confidence": 0.95,
+    "extracted_data": {}
+}
+
+Intenções possíveis:
+- transfer: Usuário está relatando uma transferência entre contas (ex: "transferi 5000 da bb vi pra rico Ju", "movi 3000 de nubank para itau")
+- expense: Usuário está relatando um gasto/compra (ex: "gastei R$ 50 no mercado", "comprei R$ 30 de comida")
+- command: Usuário está usando um comando (ex: "/status", "/help")
+- other: Outra intenção não relacionada a finanças
+
+Para transferências, inclua em extracted_data:
+{
+    "valor": 5000.0,
+    "conta_origem": "BB VI",
+    "conta_destino": "Rico Ju"
+}
+
+Para gastos, inclua em extracted_data:
+{
+    "valor": 50.0,
+    "estabelecimento": "mercado"
+}
+
+Responda APENAS com o JSON, sem texto adicional."""
+
+        user_prompt = f"""
+Mensagem do usuário: "{message_content}"
+
+Identifique a intenção e retorne o JSON."""
+
+        response = openai_client.chat.completions.create(
+            model=Config.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=200,
+            temperature=0.1
+        )
+        
+        content = response.choices[0].message.content.strip()
+        logger.info(f"Resposta OpenAI (detecção de intenção): {content}")
+        
+        # Limpar a resposta
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        if not content:
+            raise ValueError("Resposta vazia da OpenAI")
+        
+        result = json.loads(content)
+        
+        # Validar estrutura do resultado
+        if "intent" not in result:
+            raise ValueError("Resposta não contém 'intent'")
+        
+        logger.info(f"OpenAI detectou intenção: {result['intent']}")
+        return result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Erro JSON ao detectar intenção: {e}")
+        # Fallback: assumir que é um gasto se contém palavras-chave
+        message_lower = message_content.lower()
+        if any(keyword in message_lower for keyword in ["transferi", "transf", "movi", "para", "pra"]):
+            return {"intent": "transfer", "confidence": 0.7, "extracted_data": {}}
+        elif any(keyword in message_lower for keyword in ["gastei", "comprei", "paguei", "mercado", "farmácia"]):
+            return {"intent": "expense", "confidence": 0.7, "extracted_data": {}}
+        else:
+            return {"intent": "other", "confidence": 0.5, "extracted_data": {}}
+            
+    except Exception as e:
+        logger.error(f"Erro ao detectar intenção com OpenAI: {e}")
+        return {
+            "intent": "other",
+            "confidence": 0.0,
+            "extracted_data": {},
+            "error": str(e)
+        }
+
+async def edit_transfer_with_ai(message, context):
+    """Edita transferência usando OpenAI"""
+    try:
+        system_prompt = """Você é um assistente que ajuda a editar dados de transferências.
+
+Analise o comando do usuário e faça as alterações solicitadas na transferência.
+O usuário pode querer:
+- Mudar o valor da transferência
+- Mudar a conta de origem
+- Mudar a conta de destino
+- Mudar a descrição
+- Fazer múltiplas alterações ao mesmo tempo
+
+IMPORTANTE:
+- Se o usuário pedir para "mude valor para [novo_valor]", atualize o valor
+- Se o usuário pedir para "troque conta origem para [nova_conta]", atualize a conta de origem
+- Se o usuário pedir para "troque conta destino para [nova_conta]", atualize a conta de destino
+- Se o usuário pedir para "mude descrição para [nova_descricao]", atualize a descrição
+- Se o usuário pedir para "descrição [nova_descricao]", atualize a descrição
+- Mantenha os valores originais se não conseguir entender o comando
+
+Retorne APENAS um JSON com a estrutura atualizada, sem texto adicional."""
+
+        user_prompt = f"""
+Transferência atual: {json.dumps(context['transfer_data'])}
+Comando do usuário: '{message.content}'
+
+Atualize a transferência conforme solicitado e retorne APENAS o JSON."""
+
+        response = openai_client.chat.completions.create(
+            model=Config.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=500,
+            temperature=0.1
+        )
+        
+        content = response.choices[0].message.content.strip()
+        logger.info(f"Resposta OpenAI (edição de transferência): {content}")
+        
+        # Limpar a resposta
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        if not content:
+            raise ValueError("Resposta vazia da OpenAI")
+        
+        updated_data = json.loads(content)
+        
+        # Validar dados atualizados
+        if "valor" in updated_data and updated_data["valor"] <= 0:
+            raise ValueError("Valor da transferência deve ser maior que zero")
+        
+        if "conta_origem" in updated_data and "conta_destino" in updated_data:
+            if updated_data["conta_origem"] == updated_data["conta_destino"]:
+                raise ValueError("Conta de origem e destino não podem ser iguais")
+        
+        user_classifications[str(message.channel.id)]["transfer_data"] = updated_data
+        save_state()
+        
+        # Mostrar resumo da transferência atualizada
+        valor = updated_data.get("valor", context["transfer_data"]["valor"])
+        conta_origem = updated_data.get("conta_origem", context["transfer_data"]["conta_origem"])
+        conta_destino = updated_data.get("conta_destino", context["transfer_data"]["conta_destino"])
+        data_transferencia = updated_data.get("data_transferencia", context["transfer_data"]["data_transferencia"])
+        descricao = updated_data.get("descricao", context["transfer_data"]["descricao"])
+        
+        # Garantir que data_transferencia seja um objeto date
+        if isinstance(data_transferencia, str):
+            try:
+                data_transferencia = datetime.datetime.fromisoformat(data_transferencia).date()
+            except:
+                data_transferencia = datetime.date.today()
+        
+        summary = f"""**💸 Transferência Atualizada**
+
+💰 **Valor:** R$ {valor:.2f}
+📤 **De:** {conta_origem}
+📥 **Para:** {conta_destino}
+📅 **Data:** {data_transferencia.strftime('%d/%m/%Y')}
+📝 **Descrição:** {descricao}
+
+Está correto agora? Se sim, digite 'sim' ou 'ok'."""
+        await message.channel.send(summary)
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Erro JSON ao editar transferência: {e}")
+        await message.channel.send("Desculpe, não consegui entender a alteração. Tente ser mais específico, por exemplo: 'mude valor para 3000'")
+    except Exception as e:
+        logger.error(f"Erro ao editar transferência: {e}")
+        await message.channel.send("Desculpe, não consegui fazer a alteração. Tente ser mais específico.")
 
 # Inicializar bot
 try:
