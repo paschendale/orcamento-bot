@@ -1,0 +1,1 @@
+# Módulo de serviços (OpenAI, classificação, etc.) 
