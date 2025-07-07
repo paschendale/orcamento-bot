@@ -21,6 +21,14 @@ class StateManager:
     def save_state(self) -> None:
         """Salva o estado das conversas"""
         try:
+            # Verificar se o diretório pai existe
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Verificar se o arquivo é um diretório
+            if self.state_file.exists() and self.state_file.is_dir():
+                logger.error(f"Não é possível salvar estado: '{self.state_file}' é um diretório")
+                return
+            
             # Converter UserContext para dict
             state_data = {}
             for thread_id, context in self.user_contexts.items():
@@ -38,6 +46,12 @@ class StateManager:
         try:
             if not self.state_file.exists():
                 logger.info("Arquivo de estado não encontrado, iniciando com estado vazio")
+                self.user_contexts = {}
+                return
+            
+            # Verificar se é um arquivo, não um diretório
+            if self.state_file.is_dir():
+                logger.error(f"'{self.state_file}' é um diretório, não um arquivo. Criando novo arquivo de estado.")
                 self.user_contexts = {}
                 return
             

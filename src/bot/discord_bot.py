@@ -105,7 +105,7 @@ class DiscordBot:
             # Limpar recursos
             try:
                 from database import db_manager
-                db_manager.close()
+                await db_manager.close()
             except:
                 pass
     
