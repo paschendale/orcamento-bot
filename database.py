@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+import asyncio
 from typing import List, Tuple, Optional
 from config import Config
 
@@ -9,18 +10,38 @@ class DatabaseManager:
     def __init__(self):
         self.pool = None
     
-    async def initialize(self):
-        """Inicializa o pool de conexões"""
-        try:
-            self.pool = await asyncpg.create_pool(
-                Config.DATABASE_URL,
-                min_size=Config.DB_POOL_MIN_SIZE,
-                max_size=Config.DB_POOL_MAX_SIZE
-            )
-            logger.info("Pool de conexões do banco de dados inicializado")
-        except Exception as e:
-            logger.error(f"Erro ao inicializar pool de conexões: {e}")
-            raise
+    async def initialize(self, max_retries: int = 3, retry_delay: float = 5.0):
+        """Inicializa o pool de conexões com retry"""
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Tentativa {attempt + 1}/{max_retries} de conectar ao banco de dados...")
+                
+                self.pool = await asyncpg.create_pool(
+                    Config.DATABASE_URL,
+                    min_size=Config.DB_POOL_MIN_SIZE,
+                    max_size=Config.DB_POOL_MAX_SIZE,
+                    command_timeout=30,
+                    server_settings={
+                        'application_name': 'orcamento-bot'
+                    }
+                )
+                
+                # Testar conexão
+                async with self.pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                
+                logger.info("Pool de conexões do banco de dados inicializado com sucesso")
+                return
+                
+            except Exception as e:
+                logger.error(f"Erro ao inicializar pool de conexões (tentativa {attempt + 1}): {e}")
+                
+                if attempt < max_retries - 1:
+                    logger.info(f"Aguardando {retry_delay} segundos antes da próxima tentativa...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error("Todas as tentativas de conexão falharam")
+                    raise
     
     async def close(self):
         """Fecha o pool de conexões"""
